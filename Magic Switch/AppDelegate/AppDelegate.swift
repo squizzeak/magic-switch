@@ -761,24 +761,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard let self = self else { return }
         self.bluetoothStore.isFullSetSwitchPending = false
         switch result {
-        case .success, .failure(.connectionFailed), .failure(.connectTimeout):
-          // The transfer is nowhere near done: the peer has only *released*
-          // (or vanished); the local re-pairing below is the long half.
+        case .success:
+          // The transfer is nowhere near done: the peer has only *released*;
+          // the local re-pairing below is the long half.
           // Convert the explicit "receiving" into a held one so the icon
           // stays up until the last `.connecting` row settles, instead of
           // reverting here — before the first local connect even starts.
           self.beginTransferHold(.receiving)
-          // Either the peer released everything (success), or we couldn't
-          // reach it at all — in which case its machine is unreachable
-          // (asleep, off the network, app not running) and it isn't holding
-          // the peripherals anymore, since a Mac that drops off the network
-          // has already released its Bluetooth devices. Both ways the
-          // peripherals are free: grab them locally instead of stranding the
-          // user with an error they can't act on, and arm the auto-reconnect
-          // watcher as the retry safety net for any device stuck in the
-          // bonded-but-not-connected state that needs a power-cycle. Mirrors
-          // `takePeripheralFromPeer`'s success + unreachable arms, at full-set
-          // scope.
+          // A successful release is enough to start takeover. An unreachable
+          // peer may still be connected to the peripheral, so a failed
+          // round-trip must wait for an explicit HOLDS_ONE "not holding" reply.
           self.bluetoothStore.peripherals.forEach { peripheral in
             let state = self.bluetoothStore.connectionState(for: peripheral.id)
             guard state != .connecting, state != .releasing else { return }
@@ -787,12 +779,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
           }
         case .failure(let err):
           self.endTransfer()
-          // Reachable peer but the release-all errored, so we can't be sure
-          // it let go. Don't grab outright (that could yank a peripheral from
-          // a peer that didn't release); arm the HOLDS_ONE-gated watcher,
-          // which reclaims each one only once the peer confirms it isn't
-          // holding it — and recovers the case where the peer released but
-          // the ack was lost.
+          // The peer may still be connected, or the release may have happened
+          // and its acknowledgment been lost. Wait for an explicit HOLDS_ONE
+          // "not holding" response before attempting takeover.
           self.bluetoothStore.peripherals.forEach { peripheral in
             self.bluetoothStore.armReconnectForTakeover(
               peripheral.id, peerMayStillBeReleasing: true)

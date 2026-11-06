@@ -89,18 +89,6 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     /// release still finishing. `intentionalReleaseGrace` must cover this plus
     /// `releaseDisconnectTimeout`.
     static let peerReleaseGrace: TimeInterval = 30
-    /// Consecutive peer-absent `HOLDS_ONE` probes an *adoption* needs before
-    /// it takes a peripheral. Two probes (one extra tick) give Wi-Fi that's
-    /// still reassociating after wake a chance to come up — so a peer that's
-    /// actually alive gets to answer and stand the adoption down — while
-    /// keeping lid-open → peripheral-back under ~20s.
-    static let adoptionRequiredAbsentStreak = 2
-    /// Failed local pair attempts after which an adoption gives up. A free
-    /// peripheral pairs on the first try; repeated failures usually mean it's
-    /// still held by a peer we can't reach over the network (pairing a held
-    /// Magic device just hangs), so bound the phantom "Pairing…" churn.
-    /// Reclaims — a prior claim — keep the full `reconnectMaxWindow` retry.
-    static let adoptionMaxPairAttempts = 3
   }
 
   // MARK: - Dependencies
@@ -256,7 +244,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// bound). An entry comes in one of two flavours: a *reclaim* (default —
   /// this Mac has a prior claim: a genuine drop, a failed handoff, or a held
   /// set being chased back after wake) or an *adoption* (no prior claim; see
-  /// `adoptionProgress`). Main-only.
+  /// `adoptionWatchlist`). Main-only.
   private var reconnectWatchlist: [String: Date] = [:]
 
   /// Ids with a probe/reclaim chain in flight, so overlapping ticks don't
@@ -277,25 +265,11 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// Doubles as `pollPeerRelease`'s token. Main-only.
   private var peerReleaseDeadlines: [String: Date] = [:]
 
-  /// Per-id bookkeeping for adoption arms; see `adoptionProgress`.
-  private struct AdoptionProgress {
-    /// Consecutive `HOLDS_ONE` probes that ended peer-absent (unreachable at
-    /// the TCP/connect layer). Reset implicitly: any answered probe stands
-    /// the adoption down instead.
-    var peerAbsentStreak = 0
-    /// Local pair attempts made for this adoption so far.
-    var pairAttempts = 0
-  }
-
   /// Watchlist entries armed as *adoption*: peripherals this Mac wasn't
-  /// holding (they lived on the peer) whose peer has dropped off the network
-  /// — slept, shut down, or left. Presence in this map is what distinguishes
-  /// an adoption from a reclaim. Adoption is deliberately more polite: it
-  /// takes a peripheral only from a *provably absent* peer (per
-  /// `continueAdoption`), stands down the moment a live peer answers at all
-  /// — "not holding" included, so a prior holder's reclaim or the user
-  /// outranks it — and caps its pair attempts. Main-only.
-  private var adoptionProgress: [String: AdoptionProgress] = [:]
+  /// holding when the peer dropped off the network. These have no prior claim,
+  /// so they are taken only after an authenticated HOLDS_ONE says the peer
+  /// isn't holding them. Main-only.
+  private var adoptionWatchlist: Set<String> = []
 
   /// Ids we released on purpose (handoff, Send, sleep), each with
   /// the time it was flagged. The disconnect notification that follows within
@@ -672,9 +646,10 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         // main-only connection state.
         DispatchQueue.main.async {
           guard let self = self else { return }
-          // `.success` = peer holds it (in use over there) → leave it.
-          // Any `.failure` (peer says no, or unreachable) → take it back.
-          guard case .failure = result,
+          // Only an authenticated "not holding" response proves the peer has
+          // released it. A timeout or connection failure leaves ownership
+          // unknown; the reconnect watcher will retry when the peer is back.
+          guard case .failure(.remoteOperationFailed) = result,
             self.connectionState(for: id) == .disconnected
           else { return }
           guard !self.isFullSetSwitchPending else {
@@ -878,12 +853,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       sendPeripheralToPeer(peripheral)
     case .disconnected:
       guard direction != .send else { return }
-      if canSwitch {
-        takePeripheralFromPeer(peripheral)
-      } else {
-        // No peer to ask — pair it to this Mac directly over Bluetooth.
-        connectPeripheral(peripheral)
-      }
+      takePeripheralFromPeer(peripheral)
     case .connecting, .releasing:
       break  // handoff in flight
     }
@@ -936,23 +906,40 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// only honor one host at a time, so `IOBluetoothDevicePair.start()`
   /// would hang otherwise.
   ///
-  /// Falls back to a plain local pair if there's no trusted paired peer, if
-  /// neither Bonjour nor the last reachability probe (which also tries BLE)
-  /// sees it, or if the release request can't reach it.
+  /// Falls back to a plain local pair only if there's no trusted paired peer.
+  /// If the peer is unreachable, its bond state is unknown: wait for a later
+  /// HOLDS_ONE response rather than racing it to the peripheral.
   ///
   /// If the take fails — or the peer releases but the local connect doesn't
   /// take (a stuck device needing a power-cycle) — the auto-reconnect watcher
   /// keeps trying, gated by `HOLDS_ONE` so it never grabs a device the peer is
   /// actually holding.
   func takePeripheralFromPeer(_ peripheral: BluetoothPeripheral) {
-    guard !isFullSetSwitchPending else { return }
+    guard !isFullSetSwitchPending,
+      connectionState(for: peripheral.id) != .connecting,
+      connectionState(for: peripheral.id) != .releasing
+    else { return }
     let networkStore = NetworkDeviceStore.shared
     guard let device = networkStore.networkDevices.first,
       PairingStore.shared.isPaired,
-      device.pendingFingerprint == nil,
-      device.isActive || networkStore.isReachable(device.id)
+      device.pendingFingerprint == nil
     else {
       connectPeripheral(peripheral)
+      return
+    }
+    guard device.isActive || networkStore.isReachable(device.id) else {
+      setPeripheralError(
+        String(localized: "Couldn't confirm the other Mac released this peripheral."),
+        for: peripheral.id, persistent: true)
+      armTakeReconnect(peripheral.id, peerMayStillBeReleasing: true)
+      NotificationManager.showNotification(
+        title: String(localized: "Couldn't Switch"),
+        body: String(
+          localized:
+            "Couldn't confirm whether \(device.name) is using \(peripheral.name). Magic Switch will retry when it can reach that Mac."
+        ),
+        identifier: "take-preflight-failed-\(peripheral.id)"
+      )
       return
     }
 
@@ -983,26 +970,15 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
           // It self-disarms once we're connected.
           self.connectPeripheralFromPeer(peripheral)
           self.armTakeReconnect(peripheral.id)
-        case .failure(.connectionFailed), .failure(.connectTimeout):
-          // We never got a TCP connection up, so the peer's machine is
-          // unreachable (asleep, off the network, app not running) and isn't
-          // holding the peripheral anymore — a Mac that drops off the network
-          // has already released its Bluetooth devices. Pair locally instead
-          // of stranding the user with an error they can't act on, and arm the
-          // watcher as the same retry safety net. We deliberately don't grab on
-          // post-connect failures (next case): if the connection opened, the
-          // peer's machine is awake and may still actively hold the peripheral.
-          self.connectPeripheralFromPeer(peripheral)
-          self.armTakeReconnect(peripheral.id)
         case .failure(let err):
-          // Reachable peer but the release errored, so we can't be sure it let
-          // go. Don't grab it outright (that could yank it from a peer that did
-          // take it); arm the HOLDS_ONE-gated watcher, which reclaims it only
-          // once the peer confirms it isn't holding it — and recovers the case
-          // where the peer released but the ack was lost.
+          // The peer may still be connected, or the release may have happened
+          // and its acknowledgment been lost. Wait for an explicit HOLDS_ONE
+          // "not holding" response before attempting takeover.
           self.setConnectionState(.disconnected, for: peripheral.id)
           self.armTakeReconnect(peripheral.id, peerMayStillBeReleasing: true)
-          self.setPeripheralError(String(localized: "Switch failed."), for: peripheral.id)
+          self.setPeripheralError(
+            String(localized: "Couldn't confirm the other Mac released this peripheral."),
+            for: peripheral.id, persistent: true)
           NotificationManager.showNotification(
             title: String(localized: "Couldn't Switch"),
             body:
@@ -1035,7 +1011,10 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// it's rolled back onto this Mac rather than left stranded — via the
   /// `HOLDS_ONE`-gated watcher.
   func sendPeripheralToPeer(_ peripheral: BluetoothPeripheral) {
-    guard !isFullSetSwitchPending else { return }
+    guard !isFullSetSwitchPending,
+      connectionState(for: peripheral.id) != .connecting,
+      connectionState(for: peripheral.id) != .releasing
+    else { return }
     let networkStore = NetworkDeviceStore.shared
     guard let device = networkStore.networkDevices.first, PairingStore.shared.isPaired else {
       // No peer to hand off to — releasing locally is the only thing we can do.
@@ -1056,7 +1035,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         case .failure(let err):
           // Peer unreachable — nothing released, peripheral stays on this Mac.
           self.setConnectionState(.connected, for: peripheral.id)
-          self.setPeripheralError(String(localized: "Switch failed."), for: peripheral.id)
+          self.setPeripheralError(String(localized: "Couldn't reach the other Mac."), for: peripheral.id)
           NotificationManager.showNotification(
             title: String(localized: "Couldn't Switch"),
             body: String(localized: "Kept \(peripheral.name) on this Mac. \(err.userMessage)"),
@@ -1143,7 +1122,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
           // where it ended up; clear the "Sending…" row.
           self.setConnectionState(.disconnected, for: peripheral.id)
           self.armReconnect(peripheral.id)
-          self.setPeripheralError(String(localized: "Switch failed."), for: peripheral.id)
+          self.setPeripheralError(
+            String(localized: "Couldn't confirm whether the other Mac took this peripheral."),
+            for: peripheral.id, persistent: true)
           NotificationManager.showNotification(
             title: String(localized: "Couldn't Switch"),
             body:
@@ -1976,13 +1957,17 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     }
   }
 
-  /// Set the inline error for a peripheral, and fade it after 5s so it doesn't
-  /// linger on the row. `setConnectionState` clears it sooner on a new attempt.
-  private func setPeripheralError(_ message: String, for id: String) {
+  /// Set the inline error for a peripheral. Transient errors fade after 5s;
+  /// recovery errors stay visible until `setConnectionState` clears them.
+  private func setPeripheralError(_ message: String, for id: String, persistent: Bool = false) {
     let apply: () -> Void = { [weak self] in
       guard let self = self else { return }
       self.peripheralOperationError[id] = message
       self.peripheralErrorTimers[id]?.cancel()
+      guard !persistent else {
+        self.peripheralErrorTimers[id] = nil
+        return
+      }
       let timer = DispatchSource.makeTimerSource(queue: .main)
       timer.schedule(deadline: .now() + 5)
       timer.setEventHandler { [weak self] in self?.clearPeripheralError(id) }
@@ -2077,10 +2062,8 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// currently connected to this Mac. Called when the peer stops being part
   /// of the picture: this Mac just woke (the peer may have slept while we
   /// did), or the reachability poll watched the peer drop off the network.
-  /// Arming broadly is safe because adoption only ever takes from a provably
-  /// absent peer (see `continueAdoption`): entries against a live peer stand
-  /// down on their first answered probe, and `armReconnect` never downgrades
-  /// an existing reclaim entry to an adoption.
+  /// Arming broadly is safe because adoption only takes after an authenticated
+  /// "not holding" response; an unreachable peer's state remains unknown.
   func armAdoptionOfUnheldPeripherals() {
     // Main-only state; called from the reachability poll's completion too.
     guard Thread.isMainThread else {
@@ -2094,8 +2077,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   }
 
   /// Arm the watcher for `id`: it'll be probed on the probe cadence and
-  /// reclaimed once it's back in range and the peer isn't using it. No-op when
-  /// the feature is off or the peripheral isn't registered to us. Preserves the
+  /// reclaimed once it's back in range and the peer explicitly says it isn't
+  /// holding it. No-op when the feature is off or the peripheral isn't
+  /// registered to us. Preserves the
   /// original arm time on re-arm so the `reconnectMaxWindow` bound counts from
   /// the first drop. `adoption` marks the polite no-prior-claim flavour; it
   /// only applies to a *fresh* arm — re-arming an existing reclaim as an
@@ -2113,7 +2097,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     guard autoReconnect, peripherals.contains(where: { $0.id == id }) else { return }
     if reconnectWatchlist[id] == nil {
       reconnectWatchlist[id] = Date()
-      if adoption { adoptionProgress[id] = AdoptionProgress() }
+      if adoption { adoptionWatchlist.insert(id) }
       Log.bluetooth.notice("Auto-reconnect: watching \(id)\(adoption ? " (adoption)" : "")")
       // If the timer is mid-interval, pull the next probe forward so this
       // newcomer is checked promptly rather than waiting out the rest of the
@@ -2123,7 +2107,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       // An explicit claim (genuine drop, failed handoff, wake reclaim) on an
       // entry armed as adoption upgrades it: from here on, a live peer
       // answering "not holding" no longer stands the watcher down.
-      adoptionProgress.removeValue(forKey: id)
+      adoptionWatchlist.remove(id)
     }
     startReconnectTimerIfNeeded()
   }
@@ -2223,7 +2207,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       return
     }
     reconnectInFlight.remove(id)
-    adoptionProgress.removeValue(forKey: id)
+    adoptionWatchlist.remove(id)
     takeArmed.remove(id)
     peerReleaseDeadlines.removeValue(forKey: id)
     guard reconnectWatchlist.removeValue(forKey: id) != nil else { return }
@@ -2297,7 +2281,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       Log.bluetooth.notice("Auto-reconnect: turned off; stopped watching")
       reconnectWatchlist.removeAll()
       reconnectInFlight.removeAll()
-      adoptionProgress.removeAll()
+      adoptionWatchlist.removeAll()
       takeArmed.removeAll()
       stopReconnectTimer()
       return
@@ -2313,6 +2297,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       if now.timeIntervalSince(armedAt) > Constants.reconnectMaxWindow {
         Log.bluetooth.notice("Auto-reconnect: giving up on \(peripheral.name)")
         if takeArmed.contains(id) {
+          setPeripheralError(
+            String(localized: "Retry after reconnecting both Macs or waking the peripheral."),
+            for: id, persistent: true)
           NotificationManager.showNotification(
             title: String(localized: "Couldn't Connect"),
             body: String(
@@ -2422,10 +2409,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   }
 
   /// `peripheral` answered a page. Ask the peer (read-only `HOLDS_ONE`)
-  /// whether it's using it: if so, stop watching (it's legitimately theirs);
-  /// otherwise — peer says no, or is unreachable — reconnect locally. This is
-  /// the same guard the wake-reclaim uses: we never yank a peripheral the
-  /// peer is actively using, and we never tell the peer to disconnect.
+  /// whether it's using it. Only an authenticated "not holding" reply permits
+  /// reclaim; an unreachable peer's state is unknown, not proof the peripheral
+  /// is free.
   private func reclaimIfPeerIsFree(_ peripheral: BluetoothPeripheral) {
     let id = peripheral.id
     guard PairingStore.shared.isPaired,
@@ -2433,7 +2419,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       device.pendingFingerprint == nil
     else {
       reconnectInFlight.remove(id)
-      if adoptionProgress[id] != nil {
+      if adoptionWatchlist.contains(id) {
         // No trusted peer to consult and no prior claim on the peripheral —
         // stand down rather than grab one whose holder we can't even ask.
         disarmReconnect(id, reason: "no trusted peer")
@@ -2466,81 +2452,27 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
           Log.bluetooth.notice(
             "Auto-reconnect: \(peripheral.name) held by \(device.name); leaving it")
           self.disarmReconnect(id)
-        case .failure(let failure):
+        case .failure(.remoteOperationFailed):
           guard self.reconnectWatchlist[id] != nil,
             !self.isFullSetSwitchPending,
             self.connectionState(for: id) == .disconnected
           else { return }
-          if let deadline = self.peerReleaseDeadlines[id], Date() < deadline {
-            guard case .remoteOperationFailed = failure else {
-              Log.bluetooth.notice(
-                "Auto-reconnect: couldn't ask \(device.name) about \(peripheral.name); waiting for its release"
-              )
-              return
-            }
-          }
-          if self.adoptionProgress[id] != nil {
-            self.continueAdoption(of: peripheral, after: failure)
-            return
-          }
           Log.bluetooth.notice("Auto-reconnect: reclaiming \(peripheral.name)")
           self.connectPeripheral(
             peripheral,
             announcePairTimeout: false,
             completion: nil
           )
+        case .failure:
+          // A transport failure, timeout, or malformed reply cannot establish
+          // that the peer released the peripheral. Keep watching; do not make
+          // the two Macs race to pair it.
+          Log.bluetooth.notice(
+            "Auto-reconnect: couldn't confirm whether \(device.name) holds \(peripheral.name); waiting"
+          )
         }
       }
     }
-  }
-
-  /// Adoption-flavoured continuation of `reclaimIfPeerIsFree`'s failure arm
-  /// (runs on main). A reclaim takes the peripheral on *any* `HOLDS_ONE`
-  /// failure; an adoption — no prior claim — takes it only once the peer is
-  /// provably absent: unreachable at the connect layer for
-  /// `adoptionRequiredAbsentStreak` consecutive probes. A peer that answers
-  /// at all — an explicit "not holding" (`.remoteOperationFailed`) included — outranks
-  /// us, so stand down and leave the move to its reclaim or to the user.
-  /// Pair attempts are capped: a free peripheral pairs on the first try, so
-  /// repeated failures mean it's busy with a peer we can't reach.
-  private func continueAdoption(of peripheral: BluetoothPeripheral, after failure: OutgoingFailure)
-  {
-    let id = peripheral.id
-    guard var progress = adoptionProgress[id] else { return }
-    switch failure {
-    case .connectionFailed, .connectTimeout:
-      progress.peerAbsentStreak += 1
-    default:
-      // The peer's machine accepted the TCP connection even though the probe
-      // failed past that point — that's a live peer, not an absent one.
-      Log.bluetooth.notice("Adoption: \(peripheral.name) — peer is up; standing down")
-      disarmReconnect(id)
-      return
-    }
-    guard progress.peerAbsentStreak >= Constants.adoptionRequiredAbsentStreak else {
-      adoptionProgress[id] = progress
-      return
-    }
-    guard progress.pairAttempts < Constants.adoptionMaxPairAttempts else {
-      Log.bluetooth.notice(
-        "Adoption: giving up on \(peripheral.name) after \(progress.pairAttempts) pair attempts")
-      disarmReconnect(id)
-      return
-    }
-    progress.pairAttempts += 1
-    adoptionProgress[id] = progress
-    Log.bluetooth.notice("Adoption: taking \(peripheral.name) (attempt \(progress.pairAttempts))")
-    // Adoption is a take-from-peer grab (the peer vanished), so a refused
-    // bonded open escalates to a bond refresh like the other take-from-peer
-    // callers — otherwise a peripheral stuck at `paired=true` with
-    // `openConnection()` failing never comes over.
-    // Stays silent (`announcePairTimeout: false`): this is a background retry.
-    connectPeripheral(
-      peripheral,
-      announcePairTimeout: false,
-      refreshStaleBondOnFailedOpen: true,
-      completion: nil
-    )
   }
 
   // MARK: - Private Methods
